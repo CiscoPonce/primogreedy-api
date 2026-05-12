@@ -30,8 +30,8 @@ A lightweight FastAPI wrapper around [DuckDB](https://duckdb.org/) for managing 
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/CiscoPonce/primogreedy.git
-   cd primogreedy
+   git clone https://github.com/CiscoPonce/primogreedy-api.git
+   cd primogreedy-api
    ```
 
 2. Create and activate a virtual environment:

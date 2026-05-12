@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: primogreedy-api
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    environment:
+      - DUCKDB_PATH=/app/data.duckdb
+      - VPS_API_KEY=5ZhJ_T2gTTQp-LAJKdWMvKJgQSqFU8MSfFDAi04tNr0
+    restart: always

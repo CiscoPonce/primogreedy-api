@@ -483,15 +483,41 @@ def _derive_action(stage: str, proposed: str) -> str:
     }.get(stage or "", "PENDING")
 
 
+def _coerce_date(val):
+    """Best-effort parse of an LLM-supplied date into YYYY-MM-DD, else None.
+
+    Free-tier models often return prose (e.g. "after Q3 earnings") for
+    ``next_review_at``.  Binding that straight into the DATE column raised a
+    DuckDB ConversionException and 500'd the entire analysis, so the analysis
+    was silently lost.  Anything unparseable becomes NULL instead.
+    """
+    if not val:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try:
+            return datetime.strptime(m.group(0), "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    for fmt in ("%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y",
+                "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    logger.warning("Unparseable next_review_at %r -> NULL", s[:80])
+    return None
+
+
 @app.post("/analyses")
 def submit_analysis(body: AnalysisIn, x_api_key: str = Header(...)):
     """Store a structured analysis and stage the ticker on the watchlist."""
     verify_key(x_api_key)
     stage = body.stage or _derive_stage(body.verdict)
-    try:
-        next_review = body.next_review_at or None
-    except Exception:
-        next_review = None
+    next_review = _coerce_date(body.next_review_at)
 
     with get_db_ctx() as con:
         insert_cols = [c for c in _ANALYSIS_COLS if c not in ("id", "analyzed_at")]

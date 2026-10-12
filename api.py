@@ -7,10 +7,12 @@ Usage:
     uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
+import json
+import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -23,8 +25,14 @@ from pydantic import BaseModel
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 DB_PATH = os.getenv("DUCKDB_PATH", "/home/ubuntu/primogreedy/data.duckdb")
-API_KEY = os.getenv("VPS_API_KEY", "5ZhJ_T2gTTQp-LAJKdWMvKJgQSqFU8MSfFDAi04tNr0")
+API_KEY = os.getenv("VPS_API_KEY", "")
+if not API_KEY:
+    logger.warning("VPS_API_KEY environment variable is not set!")
+
 MEMORY_TTL_LONG = 30 * 24 * 60 * 60   # 30 days — BUY / STRONG BUY
 MEMORY_TTL_SHORT = 14 * 24 * 60 * 60  # 14 days — AVOID / WATCH / unknown
 
@@ -38,11 +46,21 @@ def get_db() -> duckdb.DuckDBPyConnection:
     return duckdb.connect(DB_PATH)
 
 
+@contextmanager
+def get_db_ctx():
+    """Context manager for DuckDB connections to ensure proper closure."""
+    con = get_db()
+    try:
+        yield con
+    finally:
+        con.close()
+
+
 def init_db():
     """Create tables if they don't exist."""
-    con = get_db()
-    con.execute("""
-        CREATE SEQUENCE IF NOT EXISTS portfolio_seq START 1;
+    with get_db_ctx() as con:
+        con.execute("""
+            CREATE SEQUENCE IF NOT EXISTS portfolio_seq START 1;
 
         CREATE TABLE IF NOT EXISTS seen_tickers (
             ticker    VARCHAR NOT NULL PRIMARY KEY,
@@ -74,8 +92,62 @@ def init_db():
             latency_ms  INTEGER,
             region      VARCHAR DEFAULT 'USA'
         );
+
+        CREATE SEQUENCE IF NOT EXISTS analysis_seq START 1;
+
+        -- Structured investment analyses (proposal.md framework: 3-layer method).
+        CREATE TABLE IF NOT EXISTS analyses (
+            id                INTEGER PRIMARY KEY DEFAULT nextval('analysis_seq'),
+            ticker            VARCHAR NOT NULL,
+            analyzed_at       TIMESTAMP DEFAULT current_timestamp,
+            stage             VARCHAR NOT NULL,   -- RESEARCH | WATCHLIST | BUY_CANDIDATE | DISCARD
+            verdict           VARCHAR,            -- STRONG BUY | BUY | WATCH | AVOID (legacy label)
+            source            VARCHAR DEFAULT 'unknown',
+            price             DOUBLE,
+            currency          VARCHAR DEFAULT 'USD',
+            business_summary       TEXT,
+            financial_evolution    TEXT,
+            cash_flow              TEXT,
+            debt_liquidity         TEXT,
+            dilution               TEXT,
+            valuation_method       TEXT,
+            valuation_bear         TEXT,
+            valuation_base         TEXT,
+            valuation_bull         TEXT,
+            valuation_range_low    DOUBLE,
+            valuation_range_high   DOUBLE,
+            margin_of_safety       TEXT,
+            risks                  TEXT,
+            invalidation_facts     TEXT,
+            macro_factors          TEXT,
+            portfolio_fit          TEXT,
+            sources                TEXT,   -- JSON: [{type,url,date,period}]
+            data_quality           TEXT,   -- JSON: {facts,estimates,inferences,unverified,pending}
+            proposed_action        VARCHAR, -- PENDING|INITIATE|MAINTAIN|INCREASE|REDUCE|CLOSE|DISCARD
+            review_trigger         TEXT,
+            next_review_at         DATE,
+            report_text            TEXT,
+            position_size          DOUBLE DEFAULT 0,
+            created_at             TIMESTAMP DEFAULT current_timestamp
+        );
+
+        -- Watchlist funnel: research stage -> accept/dismiss decision gate.
+        CREATE TABLE IF NOT EXISTS watchlist (
+            ticker      VARCHAR NOT NULL PRIMARY KEY,
+            stage       VARCHAR NOT NULL,
+            source      VARCHAR DEFAULT 'unknown',
+            analysis_id INTEGER,
+            reason      TEXT,
+            added_at    TIMESTAMP DEFAULT current_timestamp,
+            status      VARCHAR DEFAULT 'active'   -- active | accepted | dismissed
+        );
     """)
-    con.close()
+        # Migration for pre-existing portfolio databases
+        _cols = con.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='paper_portfolio'"
+        ).fetchall()
+        if "analysis_id" not in [c[0] for c in _cols]:
+            con.execute("ALTER TABLE paper_portfolio ADD COLUMN analysis_id INTEGER")
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +172,8 @@ app = FastAPI(
 # Auth
 # ---------------------------------------------------------------------------
 
-def verify_key(x_api_key: str = Header(...)):
-    if x_api_key != API_KEY:
+def verify_key(x_api_key: Optional[str] = Header(None)):
+    if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
@@ -132,6 +204,45 @@ class TradeFillUpdate(BaseModel):
     broker_status: str = "filled"
 
 
+class AnalysisIn(BaseModel):
+    """Structured analysis adhering to the 3-layer framework (proposal.md)."""
+    ticker: str
+    stage: Optional[str] = None            # RESEARCH|WATCHLIST|BUY_CANDIDATE|DISCARD
+    verdict: Optional[str] = None          # STRONG BUY|BUY|WATCH|AVOID
+    source: str = "unknown"
+    price: Optional[float] = None
+    currency: str = "USD"
+    business_summary: Optional[str] = None
+    financial_evolution: Optional[str] = None
+    cash_flow: Optional[str] = None
+    debt_liquidity: Optional[str] = None
+    dilution: Optional[str] = None
+    valuation_method: Optional[str] = None
+    valuation_bear: Optional[str] = None
+    valuation_base: Optional[str] = None
+    valuation_bull: Optional[str] = None
+    valuation_range_low: Optional[float] = None
+    valuation_range_high: Optional[float] = None
+    margin_of_safety: Optional[str] = None
+    risks: Optional[str] = None
+    invalidation_facts: Optional[str] = None
+    macro_factors: Optional[str] = None
+    portfolio_fit: Optional[str] = None
+    sources: Optional[list] = None          # [{type,url,date,period}]
+    data_quality: Optional[dict] = None     # {facts,estimates,inferences,unverified,pending}
+    proposed_action: Optional[str] = None   # INITIATE|MAINTAIN|INCREASE|REDUCE|CLOSE|DISCARD|PENDING
+    review_trigger: Optional[str] = None
+    next_review_at: Optional[str] = None    # YYYY-MM-DD
+    report_text: Optional[str] = None
+    position_size: Optional[float] = None
+
+
+class DecisionIn(BaseModel):
+    action: Optional[str] = None
+    position_size: Optional[float] = None
+    entry_price: Optional[float] = None
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -146,15 +257,15 @@ def health():
 # ---------------------------------------------------------------------------
 
 @app.get("/seen-tickers")
-def get_seen_tickers(x_api_key: str = Header(...)):
+def get_seen_tickers(x_api_key: Optional[str] = Header(None)):
     """Return seen tickers with verdict-aware TTL.
 
     BUY / STRONG BUY verdicts stay locked for 30 days.
     AVOID / WATCH / unknown verdicts expire after 14 days so the
     agent can re-evaluate tickers whose fundamentals may have changed.
     """
-    verify_key(x_api_key)
-    con = get_db()
+    if x_api_key:
+        verify_key(x_api_key)
 
     long_cutoff = datetime.fromtimestamp(
         time.time() - MEMORY_TTL_LONG, tz=timezone.utc
@@ -163,21 +274,21 @@ def get_seen_tickers(x_api_key: str = Header(...)):
         time.time() - MEMORY_TTL_SHORT, tz=timezone.utc
     ).strftime("%Y-%m-%d %H:%M:%S")
 
-    rows = con.execute("""
-        WITH latest_verdicts AS (
-            SELECT ticker, verdict,
-                   ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
-            FROM paper_portfolio
-        )
-        SELECT st.ticker, epoch(st.seen_at) AS ts
-        FROM seen_tickers st
-        LEFT JOIN latest_verdicts lv ON st.ticker = lv.ticker AND lv.rn = 1
-        WHERE CASE
-            WHEN lv.verdict IN ('BUY', 'STRONG BUY') THEN st.seen_at >= ?
-            ELSE st.seen_at >= ?
-        END
-    """, [long_cutoff, short_cutoff]).fetchall()
-    con.close()
+    with get_db_ctx() as con:
+        rows = con.execute("""
+            WITH latest_verdicts AS (
+                SELECT ticker, verdict,
+                       ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+                FROM paper_portfolio
+            )
+            SELECT st.ticker, epoch(st.seen_at) AS ts
+            FROM seen_tickers st
+            LEFT JOIN latest_verdicts lv ON st.ticker = lv.ticker AND lv.rn = 1
+            WHERE CASE
+                WHEN lv.verdict IN ('BUY', 'STRONG BUY') THEN st.seen_at >= ?
+                ELSE st.seen_at >= ?
+            END
+        """, [long_cutoff, short_cutoff]).fetchall()
 
     return {row[0]: row[1] for row in rows}
 
@@ -185,14 +296,13 @@ def get_seen_tickers(x_api_key: str = Header(...)):
 @app.post("/seen-tickers")
 def mark_seen(body: SeenTickerIn, x_api_key: str = Header(...)):
     verify_key(x_api_key)
-    con = get_db()
-    con.execute(
-        """INSERT INTO seen_tickers (ticker, region, seen_at)
-           VALUES (?, ?, now())
-           ON CONFLICT (ticker) DO UPDATE SET seen_at = now(), region = ?""",
-        [body.ticker, body.region, body.region],
-    )
-    con.close()
+    with get_db_ctx() as con:
+        con.execute(
+            """INSERT INTO seen_tickers (ticker, region, seen_at)
+               VALUES (?, ?, now())
+               ON CONFLICT (ticker) DO UPDATE SET seen_at = now(), region = ?""",
+            [body.ticker, body.region, body.region],
+        )
     return {"status": "ok", "ticker": body.ticker}
 
 
@@ -201,17 +311,17 @@ def mark_seen(body: SeenTickerIn, x_api_key: str = Header(...)):
 # ---------------------------------------------------------------------------
 
 @app.get("/portfolio")
-def get_portfolio(x_api_key: str = Header(...)):
-    verify_key(x_api_key)
-    con = get_db()
-    rows = con.execute(
-        """SELECT ticker, entry_price, date, verdict, source 
-           FROM paper_portfolio 
-           WHERE source NOT IN ('deploy-test', 'test_suite', 'vps_test', 'test', 'e2e_test', 'smoke_test')
-             AND ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
-           ORDER BY date DESC"""
-    ).fetchall()
-    con.close()
+def get_portfolio(x_api_key: Optional[str] = Header(None)):
+    if x_api_key:
+        verify_key(x_api_key)
+    with get_db_ctx() as con:
+        rows = con.execute(
+            """SELECT ticker, entry_price, date, verdict, source 
+               FROM paper_portfolio 
+               WHERE source NOT IN ('deploy-test', 'test_suite', 'vps_test', 'test', 'e2e_test', 'smoke_test')
+                 AND ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
+               ORDER BY date DESC"""
+        ).fetchall()
 
     return [
         {
@@ -228,42 +338,37 @@ def get_portfolio(x_api_key: str = Header(...)):
 @app.post("/portfolio")
 def record_trade(body: TradeIn, x_api_key: str = Header(...)):
     verify_key(x_api_key)
-    con = get_db()
+    with get_db_ctx() as con:
+        existing = con.execute(
+            "SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?",
+            [body.ticker],
+        ).fetchone()[0]
 
-    # Strict 1-entry-per-ticker: if ticker already exists, UPDATE it.
-    existing = con.execute(
-        "SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?",
-        [body.ticker],
-    ).fetchone()[0]
+        if existing > 0:
+            con.execute(
+                """UPDATE paper_portfolio
+                   SET entry_price = ?, date = ?, verdict = ?, source = ?,
+                       position_size = ?, order_id = ?, fill_price = ?,
+                       broker_status = ?, created_at = current_timestamp
+                   WHERE ticker = ?""",
+                [body.entry_price, body.date, body.verdict, body.source,
+                 body.position_size, body.order_id, body.fill_price,
+                 body.broker_status, body.ticker],
+            )
+            return {"status": "updated", "ticker": body.ticker}
 
-    if existing > 0:
-        con.execute(
-            """UPDATE paper_portfolio
-               SET entry_price = ?, date = ?, verdict = ?, source = ?,
-                   position_size = ?, order_id = ?, fill_price = ?,
-                   broker_status = ?, created_at = current_timestamp
-               WHERE ticker = ?""",
-            [body.entry_price, body.date, body.verdict, body.source,
-             body.position_size, body.order_id, body.fill_price,
-             body.broker_status, body.ticker],
-        )
-        con.close()
-        return {"status": "updated", "ticker": body.ticker}
+        try:
+            con.execute(
+                """INSERT INTO paper_portfolio
+                   (ticker, entry_price, date, verdict, source, position_size, order_id, fill_price, broker_status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [body.ticker, body.entry_price, body.date, body.verdict,
+                 body.source, body.position_size, body.order_id,
+                 body.fill_price, body.broker_status],
+            )
+        except duckdb.ConstraintException:
+            return {"status": "duplicate", "ticker": body.ticker, "date": body.date}
 
-    # Brand-new ticker — insert
-    try:
-        con.execute(
-            """INSERT INTO paper_portfolio
-               (ticker, entry_price, date, verdict, source, position_size, order_id, fill_price, broker_status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [body.ticker, body.entry_price, body.date, body.verdict,
-             body.source, body.position_size, body.order_id,
-             body.fill_price, body.broker_status],
-        )
-    except duckdb.ConstraintException:
-        con.close()
-        return {"status": "duplicate", "ticker": body.ticker, "date": body.date}
-    con.close()
     return {"status": "ok", "ticker": body.ticker}
 
 
@@ -271,15 +376,14 @@ def record_trade(body: TradeIn, x_api_key: str = Header(...)):
 def update_trade_fill(ticker: str, body: TradeFillUpdate, x_api_key: str = Header(...)):
     """Update a trade's broker fill information after order execution."""
     verify_key(x_api_key)
-    con = get_db()
-    con.execute(
-        """UPDATE paper_portfolio
-           SET order_id = ?, fill_price = ?, broker_status = ?
-           WHERE ticker = ? AND order_id = ? OR (ticker = ? AND date = current_date)""",
-        [body.order_id, body.fill_price, body.broker_status,
-         ticker, body.order_id, ticker],
-    )
-    con.close()
+    with get_db_ctx() as con:
+        con.execute(
+            """UPDATE paper_portfolio
+               SET order_id = ?, fill_price = ?, broker_status = ?
+               WHERE ticker = ? AND (order_id = ? OR date = current_date)""",
+            [body.order_id, body.fill_price, body.broker_status,
+             ticker, body.order_id],
+        )
     return {"status": "ok", "ticker": ticker}
 
 
@@ -287,10 +391,9 @@ def update_trade_fill(ticker: str, body: TradeFillUpdate, x_api_key: str = Heade
 def delete_portfolio_entry(ticker: str, x_api_key: str = Header(...)):
     """Delete all portfolio entries for a given ticker."""
     verify_key(x_api_key)
-    con = get_db()
-    before = con.execute("SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?", [ticker]).fetchone()[0]
-    con.execute("DELETE FROM paper_portfolio WHERE ticker = ?", [ticker])
-    con.close()
+    with get_db_ctx() as con:
+        before = con.execute("SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?", [ticker]).fetchone()[0]
+        con.execute("DELETE FROM paper_portfolio WHERE ticker = ?", [ticker])
     return {"status": "ok", "ticker": ticker, "deleted": before}
 
 
@@ -298,32 +401,307 @@ def delete_portfolio_entry(ticker: str, x_api_key: str = Header(...)):
 def deduplicate_portfolio(x_api_key: str = Header(...)):
     """Keep only the most recent entry per ticker, removing older duplicates."""
     verify_key(x_api_key)
-    con = get_db()
-    before = con.execute("SELECT COUNT(*) FROM paper_portfolio").fetchone()[0]
-    con.execute("""
-        DELETE FROM paper_portfolio
-        WHERE rowid NOT IN (
-            SELECT max(rowid) FROM paper_portfolio GROUP BY ticker
-        )
-    """)
-    after = con.execute("SELECT COUNT(*) FROM paper_portfolio").fetchone()[0]
-    con.close()
+    with get_db_ctx() as con:
+        before = con.execute("SELECT COUNT(*) FROM paper_portfolio").fetchone()[0]
+        con.execute("""
+            DELETE FROM paper_portfolio
+            WHERE rowid NOT IN (
+                SELECT max(rowid) FROM paper_portfolio GROUP BY ticker
+            )
+        """)
+        after = con.execute("SELECT COUNT(*) FROM paper_portfolio").fetchone()[0]
     return {"status": "ok", "before": before, "after": after, "removed": before - after}
 
 
-@app.get("/portfolio/evaluate")
-def evaluate_portfolio(x_api_key: str = Header(...)):
-    """Fetch live prices and compute P&L for all portfolio entries."""
+# ---------------------------------------------------------------------------
+# Analyses & Watchlist (3-layer framework: research -> watchlist -> decision)
+# ---------------------------------------------------------------------------
+
+_ANALYSIS_COLS = [
+    "id", "ticker", "analyzed_at", "stage", "verdict", "source",
+    "price", "currency", "business_summary", "financial_evolution", "cash_flow",
+    "debt_liquidity", "dilution", "valuation_method", "valuation_bear",
+    "valuation_base", "valuation_bull", "valuation_range_low",
+    "valuation_range_high", "margin_of_safety", "risks", "invalidation_facts",
+    "macro_factors", "portfolio_fit", "sources", "data_quality",
+    "proposed_action", "review_trigger", "next_review_at", "report_text",
+    "position_size",
+]
+
+_ANALYSIS_SELECT = ", ".join(_ANALYSIS_COLS)
+_ANALYSIS_SELECT_A = ", ".join(f"a.{c}" for c in _ANALYSIS_COLS)
+
+
+def _parse_json(val):
+    if not val:
+        return None
+    try:
+        return json.loads(val)
+    except Exception:
+        return val
+
+
+def _analysis_dict(r):
+    d = dict(zip(_ANALYSIS_COLS, r))
+    d["analyzed_at"] = str(d["analyzed_at"])
+    d["sources"] = _parse_json(d.get("sources"))
+    d["data_quality"] = _parse_json(d.get("data_quality"))
+    if d.get("next_review_at"):
+        d["next_review_at"] = str(d["next_review_at"])
+    return d
+
+
+def _derive_stage(verdict: str) -> str:
+    """Map legacy verdict labels onto the 4-stage funnel."""
+    upper = (verdict or "").upper()
+    if "STRONG BUY" in upper or "BUY" in upper:
+        return "BUY_CANDIDATE"
+    if "WATCH" in upper:
+        return "WATCHLIST"
+    if "AVOID" in upper or "DISCARD" in upper:
+        return "DISCARD"
+    return "RESEARCH"
+
+
+def _stage_to_verdict(stage: str) -> str:
+    return {
+        "BUY_CANDIDATE": "BUY",
+        "WATCHLIST": "WATCH",
+        "DISCARD": "AVOID",
+        "RESEARCH": "WATCH",
+    }.get(stage or "", "WATCH")
+
+
+def _derive_action(stage: str, proposed: str) -> str:
+    if proposed and proposed not in ("PENDING", ""):
+        return proposed
+    return {
+        "BUY_CANDIDATE": "INITIATE",
+        "WATCHLIST": "PENDING",
+        "RESEARCH": "PENDING",
+        "DISCARD": "DISCARD",
+    }.get(stage or "", "PENDING")
+
+
+@app.post("/analyses")
+def submit_analysis(body: AnalysisIn, x_api_key: str = Header(...)):
+    """Store a structured analysis and stage the ticker on the watchlist."""
     verify_key(x_api_key)
-    con = get_db()
-    rows = con.execute(
-        """SELECT ticker, entry_price, date, verdict, source 
-           FROM paper_portfolio 
-           WHERE source NOT IN ('deploy-test', 'test_suite', 'vps_test', 'test', 'e2e_test', 'smoke_test')
-             AND ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
-           ORDER BY date"""
-    ).fetchall()
-    con.close()
+    stage = body.stage or _derive_stage(body.verdict)
+    try:
+        next_review = body.next_review_at or None
+    except Exception:
+        next_review = None
+
+    with get_db_ctx() as con:
+        insert_cols = [c for c in _ANALYSIS_COLS if c not in ("id", "analyzed_at")]
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        con.execute(
+            f"INSERT INTO analyses ({', '.join(insert_cols)}) VALUES ({placeholders})",
+            [
+                body.ticker, stage, body.verdict, body.source,
+                body.price, body.currency, body.business_summary,
+                body.financial_evolution, body.cash_flow, body.debt_liquidity,
+                body.dilution, body.valuation_method, body.valuation_bear,
+                body.valuation_base, body.valuation_bull, body.valuation_range_low,
+                body.valuation_range_high, body.margin_of_safety, body.risks,
+                body.invalidation_facts, body.macro_factors, body.portfolio_fit,
+                json.dumps(body.sources) if body.sources else None,
+                json.dumps(body.data_quality) if body.data_quality else None,
+                body.proposed_action, body.review_trigger, next_review,
+                body.report_text, body.position_size,
+            ],
+        )
+        aid = con.execute("SELECT currval('analysis_seq')").fetchone()[0]
+
+        reason = body.verdict or ""
+        if body.valuation_base:
+            reason = f"{reason} | {body.valuation_base}"
+        con.execute(
+            """INSERT INTO watchlist (ticker, stage, source, analysis_id, reason, added_at, status)
+               VALUES (?, ?, ?, ?, ?, now(), 'active')
+               ON CONFLICT (ticker) DO UPDATE SET
+                   stage = ?, source = ?, analysis_id = ?, reason = ?,
+                   added_at = now(), status = 'active'""",
+            [body.ticker, stage, body.source, aid, reason,
+             stage, body.source, aid, reason],
+        )
+
+    return {"status": "ok", "ticker": body.ticker, "analysis_id": aid, "stage": stage}
+
+
+@app.get("/analyses")
+def list_analyses(ticker: Optional[str] = None, limit: int = 50,
+                  x_api_key: Optional[str] = Header(None)):
+    if x_api_key:
+        verify_key(x_api_key)
+    with get_db_ctx() as con:
+        if ticker:
+            rows = con.execute(
+                f"SELECT {_ANALYSIS_SELECT} FROM analyses WHERE ticker = ? ORDER BY analyzed_at DESC LIMIT ?",
+                [ticker, min(limit, 200)],
+            ).fetchall()
+        else:
+            rows = con.execute(
+                f"SELECT {_ANALYSIS_SELECT} FROM analyses ORDER BY analyzed_at DESC LIMIT ?",
+                [min(limit, 200)],
+            ).fetchall()
+    return [_analysis_dict(r) for r in rows]
+
+
+@app.get("/analyses/{ticker}")
+def get_analysis(ticker: str, x_api_key: Optional[str] = Header(None)):
+    if x_api_key:
+        verify_key(x_api_key)
+    with get_db_ctx() as con:
+        row = con.execute(
+            f"SELECT {_ANALYSIS_SELECT} FROM analyses WHERE ticker = ? ORDER BY analyzed_at DESC LIMIT 1",
+            [ticker],
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="No analysis found")
+    return _analysis_dict(row)
+
+
+@app.get("/watchlist")
+def get_watchlist(x_api_key: Optional[str] = Header(None)):
+    if x_api_key:
+        verify_key(x_api_key)
+    with get_db_ctx() as con:
+        rows = con.execute(
+            f"""SELECT {_ANALYSIS_SELECT_A}, w.stage AS wl_stage, w.status AS wl_status
+                FROM watchlist w
+                JOIN analyses a ON a.id = w.analysis_id
+                WHERE w.ticker NOT LIKE 'TEST%'
+                ORDER BY w.added_at DESC"""
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = _analysis_dict(r[:len(_ANALYSIS_COLS)])
+        d["watchlist_stage"] = r[len(_ANALYSIS_COLS)]
+        d["watchlist_status"] = r[len(_ANALYSIS_COLS) + 1]
+        d["pending_action"] = _derive_action(d["watchlist_stage"], d.get("proposed_action"))
+        out.append(d)
+    return out
+
+
+@app.get("/portfolio/reviews")
+def portfolio_reviews(x_api_key: Optional[str] = Header(None)):
+    """Active watchlist items awaiting an accept/dismiss decision."""
+    if x_api_key:
+        verify_key(x_api_key)
+    with get_db_ctx() as con:
+        rows = con.execute(
+            f"""SELECT {_ANALYSIS_SELECT_A}, w.stage AS wl_stage, w.status AS wl_status
+                FROM watchlist w
+                JOIN analyses a ON a.id = w.analysis_id
+                WHERE w.status = 'active' AND w.ticker NOT LIKE 'TEST%'
+                ORDER BY a.analyzed_at DESC"""
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = _analysis_dict(r[:len(_ANALYSIS_COLS)])
+        d["watchlist_stage"] = r[len(_ANALYSIS_COLS)]
+        d["watchlist_status"] = r[len(_ANALYSIS_COLS) + 1]
+        d["pending_action"] = _derive_action(d["watchlist_stage"], d.get("proposed_action"))
+        if d["pending_action"] in ("MAINTAIN",):
+            continue
+        out.append(d)
+    return out
+
+
+@app.post("/watchlist/{ticker}/accept")
+def accept_decision(ticker: str, body: DecisionIn, x_api_key: str = Header(...)):
+    """Accept an analysis: record the paper trade, close the review. No auto orders."""
+    verify_key(x_api_key)
+    with get_db_ctx() as con:
+        wl = con.execute(
+            "SELECT ticker, stage, source, analysis_id, status FROM watchlist WHERE ticker = ?",
+            [ticker],
+        ).fetchone()
+        if not wl:
+            raise HTTPException(status_code=404, detail="Ticker not on watchlist")
+        if wl[4] in ("accepted", "dismissed"):
+            return {"status": "already_" + wl[4], "ticker": ticker}
+
+        analysis = con.execute(
+            f"SELECT {_ANALYSIS_SELECT} FROM analyses WHERE id = ?",
+            [wl[3]],
+        ).fetchone()
+        if not analysis:
+            analysis = con.execute(
+                f"SELECT {_ANALYSIS_SELECT} FROM analyses WHERE ticker = ? ORDER BY analyzed_at DESC LIMIT 1",
+                [ticker],
+            ).fetchone()
+        if not analysis:
+            raise HTTPException(status_code=404, detail="No analysis available")
+        d = _analysis_dict(analysis)
+
+        action = body.action or d.get("proposed_action") or _derive_action(d["stage"], None)
+        entry_price = body.entry_price or d.get("price")
+        if not entry_price:
+            raise HTTPException(status_code=400, detail="No price: pass entry_price or set price in the analysis")
+        verdict_label = d.get("verdict") or _stage_to_verdict(d.get("stage"))
+        position_size = body.position_size if body.position_size is not None else (d.get("position_size") or 0.0)
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        existing = con.execute(
+            "SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?",
+            [ticker],
+        ).fetchone()[0]
+        if existing > 0:
+            con.execute(
+                """UPDATE paper_portfolio
+                   SET entry_price = ?, date = ?, verdict = ?, source = ?,
+                       position_size = ?, broker_status = 'accepted', created_at = current_timestamp,
+                       analysis_id = ?
+                   WHERE ticker = ?""",
+                [entry_price, today, verdict_label, wl[2],
+                 position_size, d["id"], ticker],
+            )
+        else:
+            con.execute(
+                """INSERT INTO paper_portfolio
+                   (ticker, entry_price, date, verdict, source, position_size,
+                    broker_status, analysis_id)
+                   VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?)""",
+                [ticker, entry_price, today, verdict_label, wl[2],
+                 position_size, d["id"]],
+            )
+        con.execute(
+            "UPDATE watchlist SET status = 'accepted' WHERE ticker = ?",
+            [ticker],
+        )
+
+    return {
+        "status": "accepted", "ticker": ticker, "action": action,
+        "entry_price": entry_price, "position_size": position_size,
+        "analysis_id": d["id"],
+    }
+
+
+@app.post("/watchlist/{ticker}/dismiss")
+def dismiss_decision(ticker: str, x_api_key: str = Header(...)):
+    """Dismiss an analysis without recording any trade."""
+    verify_key(x_api_key)
+    with get_db_ctx() as con:
+        con.execute("UPDATE watchlist SET status = 'dismissed' WHERE ticker = ?", [ticker])
+    return {"status": "dismissed", "ticker": ticker}
+
+
+@app.get("/portfolio/evaluate")
+def evaluate_portfolio(x_api_key: Optional[str] = Header(None)):
+    """Fetch live prices and compute P&L for all portfolio entries."""
+    if x_api_key:
+        verify_key(x_api_key)
+    with get_db_ctx() as con:
+        rows = con.execute(
+            """SELECT ticker, entry_price, date, verdict, source 
+               FROM paper_portfolio 
+               WHERE source NOT IN ('deploy-test', 'test_suite', 'vps_test', 'test', 'e2e_test', 'smoke_test')
+                 AND ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
+               ORDER BY date"""
+        ).fetchall()
 
     if not rows:
         return {"report": "Paper Portfolio is empty.", "trades": []}
@@ -360,7 +738,8 @@ def evaluate_portfolio(x_api_key: str = Header(...)):
                     "ticker": ticker, "date": date, "entry": entry,
                     "current": None, "gain_pct": None, "verdict": verdict,
                 })
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Error evaluating ticker {ticker}: {exc}")
             trades.append({
                 "ticker": ticker, "date": date, "entry": entry,
                 "current": None, "gain_pct": None, "verdict": verdict,
@@ -382,33 +761,31 @@ def evaluate_portfolio(x_api_key: str = Header(...)):
 # ---------------------------------------------------------------------------
 
 @app.get("/portfolio/summary")
-def portfolio_summary(x_api_key: str = Header(...)):
+def portfolio_summary(x_api_key: Optional[str] = Header(None)):
     """Aggregated portfolio stats without live price lookups."""
-    verify_key(x_api_key)
-    con = get_db()
+    if x_api_key:
+        verify_key(x_api_key)
+    with get_db_ctx() as con:
+        trades = con.execute(
+            """SELECT ticker, entry_price, date, verdict, source,
+                      position_size, order_id, fill_price, broker_status
+               FROM paper_portfolio 
+               WHERE source NOT IN ('deploy-test', 'test_suite', 'vps_test', 'test', 'e2e_test', 'smoke_test')
+                 AND ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
+               ORDER BY date DESC"""
+        ).fetchall()
 
-    trades = con.execute(
-        """SELECT ticker, entry_price, date, verdict, source,
-                  position_size, order_id, fill_price, broker_status
-           FROM paper_portfolio 
-           WHERE source NOT IN ('deploy-test', 'test_suite', 'vps_test', 'test', 'e2e_test', 'smoke_test')
-             AND ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
-           ORDER BY date DESC"""
-    ).fetchall()
+        seen_count = con.execute("""
+            SELECT COUNT(*) FROM seen_tickers
+            WHERE ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
+        """).fetchone()[0]
 
-    seen_count = con.execute("""
-        SELECT COUNT(*) FROM seen_tickers
-        WHERE ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
-    """).fetchone()[0]
-
-    runs = con.execute(
-        """SELECT id, ticker, timestamp, status, region
-           FROM agent_runs 
-           WHERE ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
-           ORDER BY timestamp DESC LIMIT 20"""
-    ).fetchall()
-
-    con.close()
+        runs = con.execute(
+            """SELECT id, ticker, timestamp, status, region
+               FROM agent_runs 
+               WHERE ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
+               ORDER BY timestamp DESC LIMIT 20"""
+        ).fetchall()
 
     by_verdict: dict[str, int] = {}
     by_source: dict[str, int] = {}
@@ -574,6 +951,28 @@ tr:hover td{background:rgba(34,211,238,.04)}
   </div>
 </div>
 
+<div class="panel" style="margin-bottom:32px">
+    <h2>Watchlist &amp; Reviews — review gate (<span id="reviewCount" style="color:var(--td);font-weight:400;font-size:13px"></span>)</h2>
+    <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input id="apiKey" type="password" placeholder="API key (only needed to accept/dismiss)"
+             style="background:var(--s2);border:1px solid var(--bd);border-radius:8px;color:var(--tx);
+                    padding:8px 12px;font-size:12px;font-family:'JetBrains Mono',monospace;min-width:240px"/>
+      <button id="saveKey" style="background:var(--s2);border:1px solid var(--bd);border-radius:8px;color:var(--cy);
+             padding:8px 14px;font-size:12px;cursor:pointer">Save key</button>
+      <span id="keyHint" style="color:var(--td);font-size:11px"></span>
+    </div>
+    <div style="overflow-x:auto">
+      <table id="reviewTable">
+        <thead><tr>
+          <th>Ticker</th><th>Stage</th><th>Verdict</th><th>Pending Action</th>
+          <th>Price</th><th>Val. Range</th><th>Margin of Safety</th>
+          <th>Sources</th><th>Next Review</th><th>Decision</th>
+        </tr></thead>
+        <tbody id="reviewBody"></tbody>
+      </table>
+    </div>
+  </div>
+
 <footer style="text-align:center;padding:28px 0 8px;border-top:1px solid var(--bd);margin-top:32px">
   <div style="margin-bottom:12px">
     <a href="https://ciscoponce.github.io/primogreedy/" target="_blank" rel="noopener"
@@ -586,10 +985,16 @@ tr:hover td{background:rgba(34,211,238,.04)}
 </div>
 
 <script>
-const API_KEY = '""" + API_KEY + """';
-const H = {'X-API-Key': API_KEY};
+const H = {};
 let sortCol = 'date', sortAsc = false;
 let evalData = [];
+
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str).replace(/[&<>"']/g, function(m) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
+  });
+}
 
 async function load() {
   try {
@@ -612,7 +1017,7 @@ async function load() {
       'Last refresh: ' + new Date().toLocaleTimeString() + ' — next in 5 min';
   } catch(e) {
     document.getElementById('cards').innerHTML =
-      '<div class="loading">Error loading data: ' + e.message + '</div>';
+      '<div class="loading">Error loading data: ' + escapeHtml(e.message) + '</div>';
   }
 }
 
@@ -625,6 +1030,7 @@ function renderCards(sum, seen, ev) {
   const winRate = ev.win_rate !== undefined ? ev.win_rate : 0;
   const returnClass = avgReturn >= 0 ? 'green' : 'red';
   const returnSign = avgReturn >= 0 ? '+' : '';
+  const sourcesStr = Object.entries(sum.by_source||{}).map(([k,v])=>escapeHtml(k)+': '+v).join(' · ');
   document.getElementById('cards').innerHTML = `
     <div class="card"><div class="label">Total Trades</div><div class="val">${sum.total_trades}</div>
       <div class="sub">${buys} buys · ${watches} watch · ${avoids} avoid</div></div>
@@ -636,13 +1042,13 @@ function renderCards(sum, seen, ev) {
       <div class="sub">Win rate: ${winRate.toFixed(0)}%</div></div>
     <div class="card"><div class="label">Seen Tickers</div><div class="val">${seenCount}</div>
       <div class="sub">Active in memory ledger</div></div>
-    <div class="card"><div class="label">Sources</div><div class="val">${Object.keys(sum.by_source).length}</div>
-      <div class="sub">${Object.entries(sum.by_source).map(([k,v])=>k+': '+v).join(' · ')}</div></div>`;
+    <div class="card"><div class="label">Sources</div><div class="val">${Object.keys(sum.by_source||{}).length}</div>
+      <div class="sub">${sourcesStr}</div></div>`;
 }
 
 let vChart, sChart;
 function renderVerdictChart(bv) {
-  const labels = Object.keys(bv), data = Object.values(bv);
+  const labels = Object.keys(bv||{}), data = Object.values(bv||{});
   const colors = labels.map(l => l==='BUY'?'#34d399':l==='STRONG BUY'?'#2dd4bf':l==='WATCH'?'#fbbf24':'#f87171');
   if (vChart) vChart.destroy();
   vChart = new Chart(document.getElementById('verdictChart'), {
@@ -709,17 +1115,22 @@ function renderTable(trades, evals) {
     const gainStr = t.gain_pct !== null
       ? `<span class="${t.gain_pct >= 0 ? 'gain-pos' : 'gain-neg'}">${t.gain_pct >= 0 ? '+' : ''}${t.gain_pct.toFixed(1)}%</span>`
       : '—';
-    const yf = t.ticker.includes('.') ? t.ticker : t.ticker;
+    const safeTicker = escapeHtml(t.ticker);
+    const safeDate = escapeHtml(t.date);
+    const safeVerdict = escapeHtml(t.verdict);
+    const safeBrokerStatus = escapeHtml(t.broker_status || 'none');
+    const safeSource = escapeHtml(t.source);
+    const yf = encodeURIComponent(t.ticker);
     return `<tr>
-      <td><a class="ticker" href="https://finance.yahoo.com/quote/${yf}" target="_blank" rel="noopener">${t.ticker}</a></td>
-      <td>${t.date}</td>
+      <td><a class="ticker" href="https://finance.yahoo.com/quote/${yf}" target="_blank" rel="noopener">${safeTicker}</a></td>
+      <td>${safeDate}</td>
       <td>$${t.entry_price.toFixed(2)}</td>
       <td>${currentStr}</td>
       <td>${gainStr}</td>
-      <td class="${vc}">${t.verdict}</td>
+      <td class="${vc}">${safeVerdict}</td>
       <td>${t.position_size > 0 ? t.position_size.toFixed(1)+'%' : '—'}</td>
-      <td class="${bc}">${t.broker_status||'none'}</td>
-      <td>${t.source}</td></tr>`;
+      <td class="${bc}">${safeBrokerStatus}</td>
+      <td>${safeSource}</td></tr>`;
   }).join('');
 }
 
@@ -731,7 +1142,80 @@ function verdictClass(v) {
   return 'verdict-avoid';
 }
 
+/* ---------- Watchlist & Reviews (review gate) ---------- */
+let API_KEY = localStorage.getItem('pg_key') || '';
 
+async function loadReviews() {
+  try {
+    const resp = await fetch('/portfolio/reviews');
+    const reviews = await resp.json();
+    const rows = Array.isArray(reviews) ? reviews : [];
+    document.getElementById('reviewCount').textContent = rows.length + ' pending';
+    document.getElementById('reviewBody').innerHTML = rows.map(r => {
+      const safeTicker = escapeHtml(r.ticker);
+      const yf = encodeURIComponent(r.ticker);
+      const stage = escapeHtml(r.stage || r.watchlist_stage || '—');
+      const verdict = escapeHtml(r.verdict || '—');
+      const action = escapeHtml(r.pending_action || r.proposed_action || '—');
+      const priceStr = r.price ? '$'+r.price.toFixed(2) : '—';
+      const rangeStr = (r.valuation_range_low && r.valuation_range_high)
+        ? '$'+r.valuation_range_low.toFixed(2)+' – $'+r.valuation_range_high.toFixed(2)
+        : '—';
+      const mosShort = r.margin_of_safety ? escapeHtml(String(r.margin_of_safety).slice(0, 90)) : '—';
+      const srcs = Array.isArray(r.sources) ? r.sources.length : (r.sources ? 1 : 0);
+      const next = r.next_review_at || '—';
+      return `<tr>
+        <td><a class="ticker" href="https://finance.yahoo.com/quote/${yf}" target="_blank" rel="noopener">${safeTicker}</a></td>
+        <td>${stage}</td>
+        <td class="${verdictClass(r.verdict)}">${verdict}</td>
+        <td>${action}</td>
+        <td>${priceStr}</td>
+        <td>${rangeStr}</td>
+        <td>${mosShort}</td>
+        <td>${srcs}</td>
+        <td>${next}</td>
+        <td style="white-space:nowrap">
+          <button onclick="decide('${safeTicker}','accept')" style="background:rgba(52,211,153,.12);border:1px solid #34d399;color:#34d399;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;margin-right:6px">Accept</button>
+          <button onclick="decide('${safeTicker}','dismiss')" style="background:rgba(248,113,113,.12);border:1px solid #f87171;color:#f87171;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">Dismiss</button>
+        </td></tr>`;
+    }).join('') || '<tr><td colspan="10" style="color:var(--td)">No pending reviews — the review gate is clear.</td></tr>';
+  } catch(e) {
+    document.getElementById('reviewBody').innerHTML =
+      '<tr><td colspan="10" style="color:var(--rd)">Error loading reviews: ' + escapeHtml(e.message) + '</td></tr>';
+  }
+}
+
+async function decide(ticker, decision) {
+  if (!API_KEY) {
+    API_KEY = prompt('Enter the VPS API key to ' + decision + ' ' + ticker + ':') || '';
+    if (!API_KEY) return;
+    localStorage.setItem('pg_key', API_KEY);
+  }
+  try {
+    const url = '/watchlist/' + encodeURIComponent(ticker) + '/' + (decision === 'accept' ? 'accept' : 'dismiss');
+    const init = {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-API-Key': API_KEY}
+    };
+    if (decision === 'accept') init.body = JSON.stringify({});
+    const resp = await fetch(url, init);
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      document.getElementById('keyHint').textContent = '';
+      load(); loadReviews();
+    } else {
+      document.getElementById('keyHint').textContent = 'Error: ' + (data.detail || resp.status);
+    }
+  } catch(e) {
+    document.getElementById('keyHint').textContent = 'Error: ' + escapeHtml(e.message);
+  }
+}
+
+document.getElementById('saveKey').addEventListener('click', () => {
+  API_KEY = document.getElementById('apiKey').value.trim();
+  localStorage.setItem('pg_key', API_KEY);
+  document.getElementById('keyHint').textContent = API_KEY ? 'Key saved.' : 'Key cleared.';
+});
 
 document.querySelectorAll('th[data-col]').forEach(th => {
   th.addEventListener('click', () => {
@@ -743,7 +1227,9 @@ document.querySelectorAll('th[data-col]').forEach(th => {
 });
 
 load();
+loadReviews();
 setInterval(load, 5 * 60 * 1000);
+setInterval(loadReviews, 5 * 60 * 1000);
 </script>
 </body>
 </html>"""

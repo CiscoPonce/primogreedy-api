@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -27,6 +28,10 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# DuckDB is single-writer. Serialize writes so two concurrent requests
+# cannot raise a write-write conflict (reads still run concurrently).
+_db_write_lock = threading.Lock()
 
 DB_PATH = os.getenv("DUCKDB_PATH", "/home/ubuntu/primogreedy/data.duckdb")
 API_KEY = os.getenv("VPS_API_KEY", "")
@@ -296,7 +301,7 @@ def get_seen_tickers(x_api_key: Optional[str] = Header(None)):
 @app.post("/seen-tickers")
 def mark_seen(body: SeenTickerIn, x_api_key: str = Header(...)):
     verify_key(x_api_key)
-    with get_db_ctx() as con:
+    with _db_write_lock, get_db_ctx() as con:
         con.execute(
             """INSERT INTO seen_tickers (ticker, region, seen_at)
                VALUES (?, ?, now())
@@ -338,7 +343,7 @@ def get_portfolio(x_api_key: Optional[str] = Header(None)):
 @app.post("/portfolio")
 def record_trade(body: TradeIn, x_api_key: str = Header(...)):
     verify_key(x_api_key)
-    with get_db_ctx() as con:
+    with _db_write_lock, get_db_ctx() as con:
         existing = con.execute(
             "SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?",
             [body.ticker],
@@ -376,7 +381,7 @@ def record_trade(body: TradeIn, x_api_key: str = Header(...)):
 def update_trade_fill(ticker: str, body: TradeFillUpdate, x_api_key: str = Header(...)):
     """Update a trade's broker fill information after order execution."""
     verify_key(x_api_key)
-    with get_db_ctx() as con:
+    with _db_write_lock, get_db_ctx() as con:
         con.execute(
             """UPDATE paper_portfolio
                SET order_id = ?, fill_price = ?, broker_status = ?
@@ -391,7 +396,7 @@ def update_trade_fill(ticker: str, body: TradeFillUpdate, x_api_key: str = Heade
 def delete_portfolio_entry(ticker: str, x_api_key: str = Header(...)):
     """Delete all portfolio entries for a given ticker."""
     verify_key(x_api_key)
-    with get_db_ctx() as con:
+    with _db_write_lock, get_db_ctx() as con:
         before = con.execute("SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?", [ticker]).fetchone()[0]
         con.execute("DELETE FROM paper_portfolio WHERE ticker = ?", [ticker])
     return {"status": "ok", "ticker": ticker, "deleted": before}
@@ -401,7 +406,7 @@ def delete_portfolio_entry(ticker: str, x_api_key: str = Header(...)):
 def deduplicate_portfolio(x_api_key: str = Header(...)):
     """Keep only the most recent entry per ticker, removing older duplicates."""
     verify_key(x_api_key)
-    with get_db_ctx() as con:
+    with _db_write_lock, get_db_ctx() as con:
         before = con.execute("SELECT COUNT(*) FROM paper_portfolio").fetchone()[0]
         con.execute("""
             DELETE FROM paper_portfolio
@@ -519,7 +524,7 @@ def submit_analysis(body: AnalysisIn, x_api_key: str = Header(...)):
     stage = body.stage or _derive_stage(body.verdict)
     next_review = _coerce_date(body.next_review_at)
 
-    with get_db_ctx() as con:
+    with _db_write_lock, get_db_ctx() as con:
         insert_cols = [c for c in _ANALYSIS_COLS if c not in ("id", "analyzed_at")]
         placeholders = ", ".join(["?"] * len(insert_cols))
         con.execute(
@@ -640,7 +645,7 @@ def portfolio_reviews(x_api_key: Optional[str] = Header(None)):
 def accept_decision(ticker: str, body: DecisionIn, x_api_key: str = Header(...)):
     """Accept an analysis: record the paper trade, close the review. No auto orders."""
     verify_key(x_api_key)
-    with get_db_ctx() as con:
+    with _db_write_lock, get_db_ctx() as con:
         wl = con.execute(
             "SELECT ticker, stage, source, analysis_id, status FROM watchlist WHERE ticker = ?",
             [ticker],
@@ -710,7 +715,7 @@ def accept_decision(ticker: str, body: DecisionIn, x_api_key: str = Header(...))
 def dismiss_decision(ticker: str, x_api_key: str = Header(...)):
     """Dismiss an analysis without recording any trade."""
     verify_key(x_api_key)
-    with get_db_ctx() as con:
+    with _db_write_lock, get_db_ctx() as con:
         con.execute("UPDATE watchlist SET status = 'dismissed' WHERE ticker = ?", [ticker])
     return {"status": "dismissed", "ticker": ticker}
 

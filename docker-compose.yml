@@ -10,5 +10,5 @@ services:
       - .:/app
     environment:
       - DUCKDB_PATH=/app/data.duckdb
-      - VPS_API_KEY=5ZhJ_T2gTTQp-LAJKdWMvKJgQSqFU8MSfFDAi04tNr0
+      - VPS_API_KEY=${VPS_API_KEY}
     restart: always

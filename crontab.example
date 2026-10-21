@@ -1,0 +1,31 @@
+# PrimoGreedy analysis crons — reference definition.
+#
+# These jobs currently run from the operator's own agent automation, NOT from
+# this file. This is a documented reference for the observed schedule so the
+# pipeline is reproducible if moved to a host cron.
+#
+# Install (host):  sudo cp crontab.example /etc/cron.d/primogreedy && \
+#                  sudo chmod 644 /etc/cron.d/primogreedy
+#
+# Both jobs POST to the API with the X-API-Key header. Keep VPS_API_KEY out of
+# this file; read it from the environment or a root-only env file.
+#
+# SHELL=/bin/sh
+# PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+#
+# Observed Morning Cron window: ~09:00–13:00 UTC.
+# Observed reeval_cron  window: ~17:00–22:00 UTC.
+#
+# 05 9  * * 1-5  ubuntu  /home/ubuntu/primogreedy/scripts/run_morning_cron.sh
+# 0  18 * * 1-5  ubuntu  /home/ubuntu/primogreedy/scripts/run_reeval_cron.sh
+#
+# The scripts above are not part of this repo yet — the agent posts /analyses
+# directly. When they exist, each should:
+#   1. curl -sf -X POST http://127.0.0.1:8081/analyses \
+#        -H "content-type: application/json" \
+#        -H "x-api-key: $VPS_API_KEY" \
+#        -d '{"ticker":"...","source":"Morning Cron", ...}'
+#   2. exit non-zero on failure so cron emails / the monitor notices.
+#
+# Health: verify the pipeline is alive with
+#   curl -s http://127.0.0.1:8081/health | grep crons_healthy

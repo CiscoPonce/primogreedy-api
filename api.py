@@ -7,12 +7,14 @@ Usage:
     uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -20,9 +22,13 @@ from typing import Optional
 import duckdb
 import yfinance as yf
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.concurrency import run_in_threadpool
 
 load_dotenv()
 
@@ -40,6 +46,29 @@ if not API_KEY:
 
 MEMORY_TTL_LONG = 30 * 24 * 60 * 60   # 30 days — BUY / STRONG BUY
 MEMORY_TTL_SHORT = 14 * 24 * 60 * 60  # 14 days — AVOID / WATCH / unknown
+
+# Live-price cache TTL for yfinance lookups (seconds). Quotes change slowly
+# relative to request volume; 10 minutes keeps /portfolio/evaluate off the
+# yfinance API for repeat hits while staying fresh enough for P&L display.
+PRICE_TTL = int(os.getenv("PRICE_TTL", str(10 * 60)))
+# Max concurrent yfinance fetches: bounded so a large portfolio cannot
+# stampede yfinance (which rate-limits aggressively) during one request.
+PRICE_FETCH_WORKERS = int(os.getenv("PRICE_FETCH_WORKERS", "8"))
+# A cron run is considered "stale" (and therefore unhealthy) if it has not
+# produced an analysis within this window. The Morning Cron fires daily.
+CRON_STALE_AFTER = int(os.getenv("CRON_STALE_AFTER", str(36 * 60 * 60)))
+
+# Wall-clock start of this process, for the /metrics uptime gauge.
+_PROCESS_STARTED_AT = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+# Per-client-IP limits. Reads are cheap; writes are capped harder because
+# DuckDB serializes on a module-level lock and each write is contended.
+limiter = Limiter(key_func=get_remote_address, default_limits=["300/minute"])
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +185,66 @@ def init_db():
 
 
 # ---------------------------------------------------------------------------
+# Live price cache (TTL)
+# ---------------------------------------------------------------------------
+
+_price_cache: dict[str, tuple[float, dict]] = {}
+_price_cache_lock = threading.Lock()
+
+
+def _cache_get(ticker: str) -> Optional[dict]:
+    """Return a cached price payload if still within PRICE_TTL, else None."""
+    with _price_cache_lock:
+        hit = _price_cache.get(ticker)
+    if hit is None:
+        return None
+    ts, payload = hit
+    if time.time() - ts > PRICE_TTL:
+        return None
+    return payload
+
+
+def _cache_put(ticker: str, payload: dict) -> None:
+    with _price_cache_lock:
+        _price_cache[ticker] = (time.time(), payload)
+    # Opportunistic pruning so the dict cannot grow without bound across a
+    # long-lived process.
+    if len(_price_cache) > 2048:
+        cutoff = time.time() - PRICE_TTL
+        with _price_cache_lock:
+            for k in [k for k, (ts, _) in _price_cache.items() if ts < cutoff]:
+                _price_cache.pop(k, None)
+
+
+def _fetch_price(ticker: str) -> dict:
+    """Fetch a single ticker's live price from yfinance (blocking).
+
+    Returns {"price": float, "currency": str}.  On any failure the price is 0
+    so callers can treat it as "unknown" rather than exploding the whole
+    evaluation for one bad symbol.
+    """
+    cached = _cache_get(ticker)
+    if cached is not None:
+        return cached
+    payload = {"price": 0.0, "currency": "USD"}
+    try:
+        info = yf.Ticker(ticker).info
+        price = info.get("currentPrice", 0) or info.get("regularMarketPrice", 0) or 0
+        currency = info.get("currency", "USD") or "USD"
+        payload = {"price": float(price or 0), "currency": currency}
+    except Exception as exc:
+        logger.warning("yfinance fetch failed for %s: %s", ticker, exc)
+    _cache_put(ticker, payload)
+    return payload
+
+
+# Bounded pool used by the async evaluate endpoint to fan out price lookups
+# without blocking the event loop.
+_price_pool = ThreadPoolExecutor(max_workers=PRICE_FETCH_WORKERS,
+                                 thread_name_prefix="price")
+
+
+# ---------------------------------------------------------------------------
 # App lifecycle
 # ---------------------------------------------------------------------------
 
@@ -164,6 +253,7 @@ async def lifespan(app: FastAPI):
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     init_db()
     yield
+    _price_pool.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -171,6 +261,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +346,71 @@ class DecisionIn(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "db": DB_PATH}
+def health(request: Request):
+    """Liveness + dependency health.
+
+    Returns ``status: "ok"`` when the DB is reachable.  ``degraded`` when the
+    database answers but the analysis crons have gone stale (no new analysis
+    within CRON_STALE_AFTER) or the DB is unreachable.
+    """
+    body = {
+        "status": "ok",
+        "db": DB_PATH,
+        "price_cache_entries": len(_price_cache),
+        "price_ttl_seconds": PRICE_TTL,
+    }
+    try:
+        with get_db_ctx() as con:
+            last = con.execute(
+                "SELECT max(analyzed_at) FROM analyses"
+            ).fetchone()[0]
+            body["last_analysis_at"] = str(last) if last else None
+            if last is not None:
+                age = (datetime.now(timezone.utc)
+                       - last.replace(tzinfo=timezone.utc)).total_seconds()
+                body["last_analysis_age_seconds"] = round(age)
+                body["crons_healthy"] = age < CRON_STALE_AFTER
+                if not body["crons_healthy"]:
+                    body["status"] = "degraded"
+    except Exception as exc:
+        logger.warning("health: DB check failed: %s", exc)
+        body["status"] = "degraded"
+        body["db_error"] = str(exc)
+    return body
+
+
+@app.get("/metrics")
+def metrics(request: Request):
+    """Lightweight JSON observability snapshot (no auth, like /health).
+
+    Deliberately Prometheus-free: the VPS runs a single container and this is
+    scraped by hand / by the monitoring agent.  Returns DB row counts, cron
+    freshness, cache stats and process uptime.
+    """
+    out = {
+        "price_cache_entries": len(_price_cache),
+        "price_ttl_seconds": PRICE_TTL,
+        "price_fetch_workers": PRICE_FETCH_WORKERS,
+        "cron_stale_after_seconds": CRON_STALE_AFTER,
+        "process_uptime_seconds": round(time.time() - _PROCESS_STARTED_AT),
+    }
+    try:
+        with get_db_ctx() as con:
+            for table in ("analyses", "paper_portfolio", "seen_tickers",
+                          "watchlist", "agent_runs"):
+                out[f"{table}_rows"] = con.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+            by_source = con.execute(
+                "SELECT source, COUNT(*) FROM analyses GROUP BY 1 ORDER BY 2 DESC"
+            ).fetchall()
+            out["analyses_by_source"] = {s: n for s, n in by_source}
+            last = con.execute("SELECT max(analyzed_at) FROM analyses").fetchone()[0]
+            out["last_analysis_at"] = str(last) if last else None
+    except Exception as exc:
+        logger.warning("metrics: DB query failed: %s", exc)
+        out["db_error"] = str(exc)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +455,8 @@ def get_seen_tickers(x_api_key: Optional[str] = Header(None)):
 
 
 @app.post("/seen-tickers")
-def mark_seen(body: SeenTickerIn, x_api_key: str = Header(...)):
+@limiter.limit("120/minute")
+def mark_seen(request: Request, body: SeenTickerIn, x_api_key: str = Header(...)):
     verify_key(x_api_key)
     with _db_write_lock, get_db_ctx() as con:
         con.execute(
@@ -341,7 +498,8 @@ def get_portfolio(x_api_key: Optional[str] = Header(None)):
 
 
 @app.post("/portfolio")
-def record_trade(body: TradeIn, x_api_key: str = Header(...)):
+@limiter.limit("60/minute")
+def record_trade(request: Request, body: TradeIn, x_api_key: str = Header(...)):
     verify_key(x_api_key)
     with _db_write_lock, get_db_ctx() as con:
         existing = con.execute(
@@ -378,7 +536,8 @@ def record_trade(body: TradeIn, x_api_key: str = Header(...)):
 
 
 @app.patch("/portfolio/{ticker}/fill")
-def update_trade_fill(ticker: str, body: TradeFillUpdate, x_api_key: str = Header(...)):
+@limiter.limit("60/minute")
+def update_trade_fill(request: Request, ticker: str, body: TradeFillUpdate, x_api_key: str = Header(...)):
     """Update a trade's broker fill information after order execution."""
     verify_key(x_api_key)
     with _db_write_lock, get_db_ctx() as con:
@@ -393,7 +552,8 @@ def update_trade_fill(ticker: str, body: TradeFillUpdate, x_api_key: str = Heade
 
 
 @app.delete("/portfolio/{ticker}")
-def delete_portfolio_entry(ticker: str, x_api_key: str = Header(...)):
+@limiter.limit("60/minute")
+def delete_portfolio_entry(request: Request, ticker: str, x_api_key: str = Header(...)):
     """Delete all portfolio entries for a given ticker."""
     verify_key(x_api_key)
     with _db_write_lock, get_db_ctx() as con:
@@ -403,7 +563,8 @@ def delete_portfolio_entry(ticker: str, x_api_key: str = Header(...)):
 
 
 @app.post("/portfolio/deduplicate")
-def deduplicate_portfolio(x_api_key: str = Header(...)):
+@limiter.limit("10/minute")
+def deduplicate_portfolio(request: Request, x_api_key: str = Header(...)):
     """Keep only the most recent entry per ticker, removing older duplicates."""
     verify_key(x_api_key)
     with _db_write_lock, get_db_ctx() as con:
@@ -518,7 +679,8 @@ def _coerce_date(val):
 
 
 @app.post("/analyses")
-def submit_analysis(body: AnalysisIn, x_api_key: str = Header(...)):
+@limiter.limit("120/minute")
+def submit_analysis(request: Request, body: AnalysisIn, x_api_key: str = Header(...)):
     """Store a structured analysis and stage the ticker on the watchlist."""
     verify_key(x_api_key)
     stage = body.stage or _derive_stage(body.verdict)
@@ -642,7 +804,8 @@ def portfolio_reviews(x_api_key: Optional[str] = Header(None)):
 
 
 @app.post("/watchlist/{ticker}/accept")
-def accept_decision(ticker: str, body: DecisionIn, x_api_key: str = Header(...)):
+@limiter.limit("60/minute")
+def accept_decision(request: Request, ticker: str, body: DecisionIn, x_api_key: str = Header(...)):
     """Accept an analysis: record the paper trade, close the review. No auto orders."""
     verify_key(x_api_key)
     with _db_write_lock, get_db_ctx() as con:
@@ -712,7 +875,8 @@ def accept_decision(ticker: str, body: DecisionIn, x_api_key: str = Header(...))
 
 
 @app.post("/watchlist/{ticker}/dismiss")
-def dismiss_decision(ticker: str, x_api_key: str = Header(...)):
+@limiter.limit("60/minute")
+def dismiss_decision(request: Request, ticker: str, x_api_key: str = Header(...)):
     """Dismiss an analysis without recording any trade."""
     verify_key(x_api_key)
     with _db_write_lock, get_db_ctx() as con:
@@ -721,8 +885,14 @@ def dismiss_decision(ticker: str, x_api_key: str = Header(...)):
 
 
 @app.get("/portfolio/evaluate")
-def evaluate_portfolio(x_api_key: Optional[str] = Header(None)):
-    """Fetch live prices and compute P&L for all portfolio entries."""
+@limiter.limit("30/minute")
+async def evaluate_portfolio(request: Request, x_api_key: Optional[str] = Header(None)):
+    """Fetch live prices and compute P&L for all portfolio entries.
+
+    Prices are served from a TTL cache and fetched concurrently in a bounded
+    thread pool, so this never blocks the event loop and never stampedes
+    yfinance for a large portfolio.
+    """
     if x_api_key:
         verify_key(x_api_key)
     with get_db_ctx() as con:
@@ -737,6 +907,14 @@ def evaluate_portfolio(x_api_key: Optional[str] = Header(None)):
     if not rows:
         return {"report": "Paper Portfolio is empty.", "trades": []}
 
+    tickers = [r[0] for r in rows]
+
+    async def _one(t: str) -> dict:
+        return await run_in_threadpool(_fetch_price, t)
+
+    results = await asyncio.gather(*(_one(t) for t in tickers))
+    prices = dict(zip(tickers, results))
+
     trades = []
     total_roi = 0.0
     winners = 0
@@ -744,33 +922,26 @@ def evaluate_portfolio(x_api_key: Optional[str] = Header(None)):
 
     for r in rows:
         ticker, entry, date, verdict, source = r[0], r[1], str(r[2]), r[3], r[4]
-        try:
-            info = yf.Ticker(ticker).info
-            price = info.get("currentPrice", 0) or info.get("regularMarketPrice", 0) or 0
-            currency = info.get("currency", "USD")
+        info = prices.get(ticker) or {}
+        price = info.get("price", 0) or 0
+        currency = info.get("currency", "USD")
 
-            # Pence → Pounds
-            if ticker.endswith(".L") or currency in ("GBp", "GBX"):
-                price = price / 100
+        # Pence → Pounds
+        if ticker.endswith(".L") or currency in ("GBp", "GBX"):
+            price = price / 100
 
-            if price > 0 and entry > 0:
-                gain = ((price - entry) / entry) * 100
-                if gain > 0:
-                    winners += 1
-                total_roi += gain
-                valid += 1
-                trades.append({
-                    "ticker": ticker, "date": date, "entry": entry,
-                    "current": round(price, 2), "gain_pct": round(gain, 2),
-                    "verdict": verdict,
-                })
-            else:
-                trades.append({
-                    "ticker": ticker, "date": date, "entry": entry,
-                    "current": None, "gain_pct": None, "verdict": verdict,
-                })
-        except Exception as exc:
-            logger.warning(f"Error evaluating ticker {ticker}: {exc}")
+        if price > 0 and entry > 0:
+            gain = ((price - entry) / entry) * 100
+            if gain > 0:
+                winners += 1
+            total_roi += gain
+            valid += 1
+            trades.append({
+                "ticker": ticker, "date": date, "entry": entry,
+                "current": round(price, 2), "gain_pct": round(gain, 2),
+                "verdict": verdict,
+            })
+        else:
             trades.append({
                 "ticker": ticker, "date": date, "entry": entry,
                 "current": None, "gain_pct": None, "verdict": verdict,

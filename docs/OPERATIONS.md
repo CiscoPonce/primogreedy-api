@@ -102,6 +102,25 @@ or from the monitoring agent; it is intentionally not Prometheus-format.
 
 Exceeding a limit returns `429 Too Many Requests`.
 
+## Review gate (human decisions)
+
+`GET /portfolio/reviews` returns **only actionable rows** by default —
+`INITIATE`, `INCREASE`, `REDUCE`, `CLOSE` — oldest first, each with
+`age_days` and `needs_review`. Watches (`PENDING`) and rejections (`DISCARD`)
+need no human input, so they are excluded; use `?include=all` to inspect the
+whole funnel.
+
+`POST /watchlist/{ticker}/accept` is action-aware:
+
+- `INITIATE` / `INCREASE` — records (or refreshes) the paper position.
+- `CLOSE` — **deletes** the paper position and marks the review accepted.
+  (Previously it inserted/refreshed a position instead, i.e. opened a trade
+  when the system said to exit.)
+- `dismiss` — closes the review without touching the portfolio.
+
+`GET /metrics` exposes `review_actionable` and `review_non_actionable` so the
+real backlog is visible without opening the dashboard.
+
 ## Price fetching
 
 `GET /portfolio/evaluate` looks up live prices via yfinance. To keep it from

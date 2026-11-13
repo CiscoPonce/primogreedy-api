@@ -407,6 +407,23 @@ def metrics(request: Request):
             out["analyses_by_source"] = {s: n for s, n in by_source}
             last = con.execute("SELECT max(analyzed_at) FROM analyses").fetchone()[0]
             out["last_analysis_at"] = str(last) if last else None
+
+            # Review-gate backlog: actionable decisions vs. watches/rejections.
+            wl = con.execute(
+                """SELECT w.stage, w.status, a.proposed_action, COUNT(*)
+                   FROM watchlist w JOIN analyses a ON a.id = w.analysis_id
+                   GROUP BY 1, 2, 3"""
+            ).fetchall()
+            actionable = backlog = 0
+            for stage, status, proposed, n in wl:
+                if status != "active":
+                    continue
+                if _derive_action(stage, proposed) in _ACTIONABLE_ACTIONS:
+                    actionable += n
+                else:
+                    backlog += n
+            out["review_actionable"] = actionable
+            out["review_non_actionable"] = backlog
     except Exception as exc:
         logger.warning("metrics: DB query failed: %s", exc)
         out["db_error"] = str(exc)
@@ -778,26 +795,42 @@ def get_watchlist(x_api_key: Optional[str] = Header(None)):
     return out
 
 
+# Actions that genuinely require a human decision.  PENDING (still watching)
+# and DISCARD (the system already rejected it) do not.  Leaving them in made
+# 102 of 125 "pending" rows pure noise, burying the real 23 decisions.
+_ACTIONABLE_ACTIONS = ("INITIATE", "INCREASE", "REDUCE", "CLOSE")
+
+
 @app.get("/portfolio/reviews")
-def portfolio_reviews(x_api_key: Optional[str] = Header(None)):
-    """Active watchlist items awaiting an accept/dismiss decision."""
+def portfolio_reviews(include: str = "actionable",
+                      x_api_key: Optional[str] = Header(None)):
+    """Watchlist rows awaiting a human accept/close decision.
+
+    Defaults to *actionable* rows only (INITIATE/INCREASE/REDUCE/CLOSE),
+    oldest first, so the queue reflects real work.  Pass ``include=all`` to
+    inspect the complete funnel (watches and rejections included).
+    """
     if x_api_key:
         verify_key(x_api_key)
     with get_db_ctx() as con:
         rows = con.execute(
-            f"""SELECT {_ANALYSIS_SELECT_A}, w.stage AS wl_stage, w.status AS wl_status
+            f"""SELECT {_ANALYSIS_SELECT_A}, w.stage AS wl_stage,
+                       w.status AS wl_status, w.added_at
                 FROM watchlist w
                 JOIN analyses a ON a.id = w.analysis_id
                 WHERE w.status = 'active' AND w.ticker NOT LIKE 'TEST%'
-                ORDER BY a.analyzed_at DESC"""
+                ORDER BY w.added_at ASC"""
         ).fetchall()
     out = []
     for r in rows:
         d = _analysis_dict(r[:len(_ANALYSIS_COLS)])
         d["watchlist_stage"] = r[len(_ANALYSIS_COLS)]
         d["watchlist_status"] = r[len(_ANALYSIS_COLS) + 1]
+        added_at = r[len(_ANALYSIS_COLS) + 2]
         d["pending_action"] = _derive_action(d["watchlist_stage"], d.get("proposed_action"))
-        if d["pending_action"] in ("MAINTAIN",):
+        d["age_days"] = (datetime.now() - added_at).days if added_at else None
+        d["needs_review"] = d["pending_action"] in _ACTIONABLE_ACTIONS
+        if include != "all" and not d["needs_review"]:
             continue
         out.append(d)
     return out
@@ -832,6 +865,24 @@ def accept_decision(request: Request, ticker: str, body: DecisionIn, x_api_key: 
         d = _analysis_dict(analysis)
 
         action = body.action or d.get("proposed_action") or _derive_action(d["stage"], None)
+
+        # CLOSE means "exit this position".  Accepting it must REMOVE the
+        # paper-portfolio row, not insert/refresh one at the current price
+        # (the old code did the latter, which silently opened a position
+        # instead of closing it).
+        if action == "CLOSE":
+            before = con.execute(
+                "SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?", [ticker]
+            ).fetchone()[0]
+            con.execute("DELETE FROM paper_portfolio WHERE ticker = ?", [ticker])
+            con.execute(
+                "UPDATE watchlist SET status = 'accepted' WHERE ticker = ?", [ticker]
+            )
+            return {
+                "status": "closed", "ticker": ticker, "action": "CLOSE",
+                "closed_positions": before, "analysis_id": d["id"],
+            }
+
         entry_price = body.entry_price or d.get("price")
         if not entry_price:
             raise HTTPException(status_code=400, detail="No price: pass entry_price or set price in the analysis")
@@ -1367,7 +1418,7 @@ async function loadReviews() {
       const srcs = Array.isArray(r.sources) ? r.sources.length : (r.sources ? 1 : 0);
       const next = r.next_review_at || '—';
       return `<tr>
-        <td><a class="ticker" href="https://finance.yahoo.com/quote/${yf}" target="_blank" rel="noopener">${safeTicker}</a></td>
+        <td><a class="ticker" href="https://finance.yahoo.com/quote/${yf}" target="_blank" rel="noopener">${safeTicker}</a>${r.age_days != null ? ' <span style="color:var(--td);font-size:10px">'+r.age_days+'d</span>' : ''}</td>
         <td>${stage}</td>
         <td class="${verdictClass(r.verdict)}">${verdict}</td>
         <td>${action}</td>
@@ -1377,7 +1428,7 @@ async function loadReviews() {
         <td>${srcs}</td>
         <td>${next}</td>
         <td style="white-space:nowrap">
-          <button onclick="decide('${safeTicker}','accept')" style="background:rgba(52,211,153,.12);border:1px solid #34d399;color:#34d399;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;margin-right:6px">Accept</button>
+          <button onclick="decide('${safeTicker}','accept')" style="background:rgba(52,211,153,.12);border:1px solid #34d399;color:#34d399;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;margin-right:6px">${r.pending_action === 'CLOSE' ? 'Close' : 'Accept'}</button>
           <button onclick="decide('${safeTicker}','dismiss')" style="background:rgba(248,113,113,.12);border:1px solid #f87171;color:#f87171;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer">Dismiss</button>
         </td></tr>`;
     }).join('') || '<tr><td colspan="10" style="color:var(--td)">No pending reviews — the review gate is clear.</td></tr>';

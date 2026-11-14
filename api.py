@@ -966,13 +966,7 @@ async def evaluate_portfolio(request: Request, x_api_key: Optional[str] = Header
     if not rows:
         return {"report": "Paper Portfolio is empty.", "trades": []}
 
-    tickers = [r[0] for r in rows]
-
-    async def _one(t: str) -> dict:
-        return await run_in_threadpool(_fetch_price, t)
-
-    results = await asyncio.gather(*(_one(t) for t in tickers))
-    prices = dict(zip(tickers, results))
+    prices = await _fetch_prices_for_tickers([r[0] for r in rows])
 
     trades = []
     total_roi = 0.0
@@ -1014,6 +1008,121 @@ async def evaluate_portfolio(request: Request, x_api_key: Optional[str] = Header
         "win_rate": round(win_rate, 1),
         "avg_return": round(avg_roi, 2),
         "trades": trades,
+    }
+
+
+async def _fetch_prices_for_tickers(tickers: list[str]) -> dict[str, dict]:
+    """Fetch live prices for unique tickers concurrently via the TTL cache."""
+    unique = list(dict.fromkeys(tickers))
+
+    async def _one(t: str) -> dict:
+        return await run_in_threadpool(_fetch_price, t)
+
+    results = await asyncio.gather(*(_one(t) for t in unique))
+    return dict(zip(unique, results))
+
+
+def _region_for_ticker(ticker: str) -> str:
+    """Infer market region from ticker exchange suffix."""
+    upper = ticker.upper()
+    if upper.endswith(".L"):
+        return "UK"
+    if upper.endswith((".TO", ".V", ".CN", ".NE")):
+        return "Canada"
+    if upper.endswith(".AX"):
+        return "Australia"
+    if "." in upper:
+        return "Other"
+    return "USA"
+
+
+def _summarize_group(items: list[dict]) -> dict:
+    """Aggregate win rate and mean/median return for a group of trades."""
+    gains = sorted(t["gain_pct"] for t in items if t["gain_pct"] is not None)
+    priced = len(gains)
+    winners = sum(1 for g in gains if g > 0)
+    avg_ret = round(sum(gains) / priced, 2) if priced else 0.0
+    if priced == 0:
+        med_ret = 0.0
+    elif priced % 2 == 1:
+        med_ret = round(gains[priced // 2], 2)
+    else:
+        med_ret = round((gains[priced // 2 - 1] + gains[priced // 2]) / 2, 2)
+    return {
+        "count": len(items),
+        "priced_count": priced,
+        "winners": winners,
+        "win_rate_pct": round((winners / priced * 100), 1) if priced else 0.0,
+        "avg_return_pct": avg_ret,
+        "median_return_pct": med_ret,
+    }
+
+
+@app.get("/portfolio/attribution")
+@limiter.limit("30/minute")
+async def portfolio_attribution(request: Request, x_api_key: Optional[str] = Header(None)):
+    """Break down realized portfolio P&L by region, verdict, and source."""
+    if x_api_key:
+        verify_key(x_api_key)
+    with get_db_ctx() as con:
+        rows = con.execute(
+            """SELECT ticker, entry_price, date, verdict, source
+               FROM paper_portfolio
+               WHERE source NOT IN ('deploy-test', 'test_suite', 'vps_test', 'test', 'e2e_test', 'smoke_test')
+                 AND ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
+               ORDER BY date"""
+        ).fetchall()
+
+    if not rows:
+        return {
+            "total_calls": 0,
+            "by_region": {},
+            "by_verdict": {},
+            "by_source": {},
+            "top_winners": [],
+            "top_losers": [],
+        }
+
+    prices = await _fetch_prices_for_tickers([r[0] for r in rows])
+    evaluated = []
+    for ticker, entry, date, verdict, source in rows:
+        info = prices.get(ticker) or {}
+        price = info.get("price", 0) or 0
+        currency = info.get("currency", "USD")
+        if ticker.endswith(".L") or currency in ("GBp", "GBX"):
+            price = price / 100
+        gain = round(((price - entry) / entry) * 100, 2) if (price > 0 and entry > 0) else None
+        evaluated.append({
+            "ticker": ticker,
+            "region": _region_for_ticker(ticker),
+            "verdict": verdict or "UNKNOWN",
+            "source": source or "unknown",
+            "date": str(date),
+            "entry": entry,
+            "current": round(price, 4) if price > 0 else None,
+            "gain_pct": gain,
+        })
+
+    def _group_by(key: str) -> dict[str, dict]:
+        buckets: dict[str, list[dict]] = {}
+        for item in evaluated:
+            buckets.setdefault(item[key], []).append(item)
+        return {k: _summarize_group(v) for k, v in sorted(buckets.items())}
+
+    priced_items = sorted(
+        (t for t in evaluated if t["gain_pct"] is not None),
+        key=lambda t: t["gain_pct"],
+        reverse=True,
+    )
+
+    return {
+        "total_calls": len(evaluated),
+        "overall": _summarize_group(evaluated),
+        "by_region": _group_by("region"),
+        "by_verdict": _group_by("verdict"),
+        "by_source": _group_by("source"),
+        "top_winners": priced_items[:5],
+        "top_losers": list(reversed(priced_items[-5:])) if priced_items else [],
     }
 
 

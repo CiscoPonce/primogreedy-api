@@ -225,3 +225,34 @@ def test_metrics_reports_review_backlog(client, auth_headers, clean_tables):
     m = client.get("/metrics").json()
     assert m["review_actionable"] >= 1
     assert m["review_non_actionable"] >= 1
+
+
+def test_portfolio_attribution(client, auth_headers, clean_tables, monkeypatch):
+    import api
+
+    client.post("/portfolio", json={"ticker": "AAPL", "entry_price": 100.0, "date": "2026-01-02",
+                                    "verdict": "BUY", "source": "Morning Cron"},
+                headers=auth_headers)
+    client.post("/portfolio", json={"ticker": "TET.L", "entry_price": 2.0, "date": "2026-01-02",
+                                    "verdict": "WATCH", "source": "reeval_cron"},
+                headers=auth_headers)
+
+    def _fake_price(ticker: str) -> dict:
+        if ticker == "AAPL":
+            return {"price": 125.0, "currency": "USD"}
+        if ticker == "TET.L":
+            return {"price": 150.0, "currency": "GBp"}  # 1.50 GBP -> -25%
+        return {"price": 0.0, "currency": "USD"}
+
+    monkeypatch.setattr(api, "_fetch_price", _fake_price)
+
+    r = client.get("/portfolio/attribution")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_calls"] == 2
+    assert body["overall"]["win_rate_pct"] == 50.0
+    assert body["by_region"]["USA"]["avg_return_pct"] == 25.0
+    assert body["by_region"]["UK"]["avg_return_pct"] == -25.0
+    assert body["by_verdict"]["BUY"]["winners"] == 1
+    assert body["top_winners"][0]["ticker"] == "AAPL"
+    assert body["top_losers"][0]["ticker"] == "TET.L"

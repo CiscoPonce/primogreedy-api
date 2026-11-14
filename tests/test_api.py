@@ -256,3 +256,33 @@ def test_portfolio_attribution(client, auth_headers, clean_tables, monkeypatch):
     assert body["by_verdict"]["BUY"]["winners"] == 1
     assert body["top_winners"][0]["ticker"] == "AAPL"
     assert body["top_losers"][0]["ticker"] == "TET.L"
+
+
+def test_close_archives_to_closed_positions_and_status_update(client, auth_headers, clean_tables, monkeypatch):
+    import api
+
+    with api.get_db_ctx() as con:
+        con.execute("DELETE FROM closed_positions")
+
+    client.post("/portfolio", json={"ticker": "ARCH1", "entry_price": 10.0,
+                                    "date": "2026-01-02", "verdict": "BUY",
+                                    "source": "pytest"}, headers=auth_headers)
+    # Mark delisted then back to active
+    st = client.patch("/portfolio/ARCH1/status", json={"status": "delisted"}, headers=auth_headers)
+    assert st.status_code == 200 and st.json()["portfolio_status"] == "delisted"
+    bad = client.patch("/portfolio/ARCH1/status", json={"status": "bogus"}, headers=auth_headers)
+    assert bad.status_code == 422
+
+    # Stage CLOSE decision with exit price 12.5 -> +25% gain
+    client.post("/analyses", json={"ticker": "ARCH1", "stage": "DISCARD",
+                                   "verdict": "AVOID", "proposed_action": "CLOSE",
+                                   "price": 12.5, "source": "pytest"}, headers=auth_headers)
+    res = client.post("/watchlist/ARCH1/accept", json={}, headers=auth_headers)
+    assert res.status_code == 200
+    assert res.json()["closed_positions"] == 1
+
+    closed = client.get("/portfolio/closed").json()
+    assert len(closed) == 1
+    assert closed[0]["ticker"] == "ARCH1"
+    assert closed[0]["exit_price"] == 12.5
+    assert closed[0]["gain_pct"] == 25.0

@@ -24,7 +24,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -184,11 +184,30 @@ def init_db():
         );
     """)
         # Migration for pre-existing portfolio databases
-        _cols = con.execute(
+        con.execute("""
+            CREATE SEQUENCE IF NOT EXISTS closed_seq START 1;
+            CREATE TABLE IF NOT EXISTS closed_positions (
+                id            INTEGER PRIMARY KEY DEFAULT nextval('closed_seq'),
+                ticker        VARCHAR NOT NULL,
+                entry_price   DOUBLE NOT NULL,
+                exit_price    DOUBLE,
+                entry_date    DATE,
+                closed_at     TIMESTAMP DEFAULT current_timestamp,
+                verdict       VARCHAR,
+                source        VARCHAR DEFAULT 'unknown',
+                gain_pct      DOUBLE,
+                analysis_id   INTEGER
+            );
+        """)
+
+        # Migration for pre-existing portfolio databases
+        _cols = [c[0] for c in con.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_name='paper_portfolio'"
-        ).fetchall()
-        if "analysis_id" not in [c[0] for c in _cols]:
+        ).fetchall()]
+        if "analysis_id" not in _cols:
             con.execute("ALTER TABLE paper_portfolio ADD COLUMN analysis_id INTEGER")
+        if "status" not in _cols:
+            con.execute("ALTER TABLE paper_portfolio ADD COLUMN status VARCHAR DEFAULT 'active'")
 
 
 # ---------------------------------------------------------------------------
@@ -404,8 +423,8 @@ def metrics(request: Request):
     }
     try:
         with get_db_ctx() as con:
-            for table in ("analyses", "paper_portfolio", "seen_tickers",
-                          "watchlist", "agent_runs"):
+            for table in ("analyses", "paper_portfolio", "closed_positions",
+                          "seen_tickers", "watchlist", "agent_runs"):
                 out[f"{table}_rows"] = con.execute(
                     f"SELECT COUNT(*) FROM {table}"
                 ).fetchone()[0]
@@ -585,6 +604,51 @@ def delete_portfolio_entry(request: Request, ticker: str, x_api_key: str = Heade
         before = con.execute("SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?", [ticker]).fetchone()[0]
         con.execute("DELETE FROM paper_portfolio WHERE ticker = ?", [ticker])
     return {"status": "ok", "ticker": ticker, "deleted": before}
+
+
+class StatusUpdate(BaseModel):
+    status: str = Field(..., pattern="^(active|delisted)$")
+
+
+@app.patch("/portfolio/{ticker}/status")
+@limiter.limit("60/minute")
+def update_portfolio_status(request: Request, ticker: str, body: StatusUpdate, x_api_key: str = Header(...)):
+    """Mark a portfolio ticker as active or delisted."""
+    verify_key(x_api_key)
+    with _db_write_lock, get_db_ctx() as con:
+        updated = con.execute(
+            "SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?", [ticker]
+        ).fetchone()[0]
+        if updated:
+            con.execute(
+                "UPDATE paper_portfolio SET status = ? WHERE ticker = ?",
+                [body.status, ticker],
+            )
+    return {"status": "ok", "ticker": ticker, "portfolio_status": body.status, "updated": updated}
+
+
+@app.get("/portfolio/closed")
+def list_closed_positions(x_api_key: Optional[str] = Header(None)):
+    """Return archived positions closed via the review gate."""
+    if x_api_key:
+        verify_key(x_api_key)
+    with get_db_ctx() as con:
+        rows = con.execute(
+            """SELECT ticker, entry_price, exit_price, entry_date, closed_at,
+                      verdict, source, gain_pct, analysis_id
+               FROM closed_positions
+               ORDER BY closed_at DESC"""
+        ).fetchall()
+    return [
+        {
+            "ticker": r[0], "entry_price": r[1], "exit_price": r[2],
+            "entry_date": str(r[3]) if r[3] else None,
+            "closed_at": str(r[4]) if r[4] else None,
+            "verdict": r[5], "source": r[6], "gain_pct": r[7],
+            "analysis_id": r[8],
+        }
+        for r in rows
+    ]
 
 
 @app.post("/portfolio/deduplicate")
@@ -879,16 +943,32 @@ def accept_decision(request: Request, ticker: str, body: DecisionIn, x_api_key: 
         # (the old code did the latter, which silently opened a position
         # instead of closing it).
         if action == "CLOSE":
-            before = con.execute(
-                "SELECT COUNT(*) FROM paper_portfolio WHERE ticker = ?", [ticker]
-            ).fetchone()[0]
+            existing_rows = con.execute(
+                """SELECT entry_price, date, verdict, source
+                   FROM paper_portfolio WHERE ticker = ?""",
+                [ticker],
+            ).fetchall()
+            exit_price = body.entry_price or d.get("price")
+            for ep, edate, everdict, esource in existing_rows:
+                gain = (
+                    round(((exit_price - ep) / ep) * 100, 2)
+                    if (exit_price is not None and ep and ep > 0)
+                    else None
+                )
+                con.execute(
+                    """INSERT INTO closed_positions
+                       (ticker, entry_price, exit_price, entry_date, verdict, source, gain_pct, analysis_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [ticker, ep, exit_price, edate, everdict, esource, gain, d["id"]],
+                )
             con.execute("DELETE FROM paper_portfolio WHERE ticker = ?", [ticker])
             con.execute(
                 "UPDATE watchlist SET status = 'accepted' WHERE ticker = ?", [ticker]
             )
             return {
                 "status": "closed", "ticker": ticker, "action": "CLOSE",
-                "closed_positions": before, "analysis_id": d["id"],
+                "closed_positions": len(existing_rows), "exit_price": exit_price,
+                "analysis_id": d["id"],
             }
 
         entry_price = body.entry_price or d.get("price")
@@ -1011,6 +1091,33 @@ async def evaluate_portfolio(request: Request, x_api_key: Optional[str] = Header
     }
 
 
+def _fetch_benchmarks() -> dict[str, dict]:
+    """Fetch 52-week change for IWM (small-cap) and SPY, TTL-cached."""
+    out = {}
+    for sym in ("IWM", "SPY"):
+        key = f"__BENCH__{sym}"
+        cached = _cache_get(key)
+        if cached is not None:
+            out[sym] = cached
+            continue
+        payload = {"price": 0.0, "change_52w_pct": None}
+        try:
+            info = yf.Ticker(sym).info
+            price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+            chg = info.get("52WeekChange")
+            if chg is None:
+                chg = info.get("SandP52WeekChange")
+            payload = {
+                "price": round(float(price or 0), 2),
+                "change_52w_pct": round(float(chg) * 100, 2) if chg is not None else None,
+            }
+        except Exception as exc:
+            logger.debug("Benchmark fetch failed for %s: %s", sym, exc)
+        _cache_put(key, payload)
+        out[sym] = payload
+    return out
+
+
 async def _fetch_prices_for_tickers(tickers: list[str]) -> dict[str, dict]:
     """Fetch live prices for unique tickers concurrently via the TTL cache."""
     unique = list(dict.fromkeys(tickers))
@@ -1066,26 +1173,32 @@ async def portfolio_attribution(request: Request, x_api_key: Optional[str] = Hea
         verify_key(x_api_key)
     with get_db_ctx() as con:
         rows = con.execute(
-            """SELECT ticker, entry_price, date, verdict, source
+            """SELECT ticker, entry_price, date, verdict, source, COALESCE(status, 'active')
                FROM paper_portfolio
                WHERE source NOT IN ('deploy-test', 'test_suite', 'vps_test', 'test', 'e2e_test', 'smoke_test')
                  AND ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
                ORDER BY date"""
         ).fetchall()
+        closed_rows = con.execute(
+            "SELECT gain_pct FROM closed_positions"
+        ).fetchall()
 
     if not rows:
         return {
             "total_calls": 0,
+            "overall": _summarize_group([]),
             "by_region": {},
             "by_verdict": {},
             "by_source": {},
             "top_winners": [],
             "top_losers": [],
+            "closed_summary": _summarize_group([{"gain_pct": cr[0]} for cr in closed_rows]),
+            "benchmarks": {},
         }
 
     prices = await _fetch_prices_for_tickers([r[0] for r in rows])
     evaluated = []
-    for ticker, entry, date, verdict, source in rows:
+    for ticker, entry, date, verdict, source, pstatus in rows:
         info = prices.get(ticker) or {}
         price = info.get("price", 0) or 0
         currency = info.get("currency", "USD")
@@ -1097,6 +1210,7 @@ async def portfolio_attribution(request: Request, x_api_key: Optional[str] = Hea
             "region": _region_for_ticker(ticker),
             "verdict": verdict or "UNKNOWN",
             "source": source or "unknown",
+            "status": pstatus,
             "date": str(date),
             "entry": entry,
             "current": round(price, 4) if price > 0 else None,
@@ -1115,6 +1229,7 @@ async def portfolio_attribution(request: Request, x_api_key: Optional[str] = Hea
         reverse=True,
     )
 
+    benchmarks = await run_in_threadpool(_fetch_benchmarks)
     return {
         "total_calls": len(evaluated),
         "overall": _summarize_group(evaluated),
@@ -1123,6 +1238,8 @@ async def portfolio_attribution(request: Request, x_api_key: Optional[str] = Hea
         "by_source": _group_by("source"),
         "top_winners": priced_items[:5],
         "top_losers": list(reversed(priced_items[-5:])) if priced_items else [],
+        "closed_summary": _summarize_group([{"gain_pct": cr[0]} for cr in closed_rows]),
+        "benchmarks": benchmarks,
     }
 
 
@@ -1138,7 +1255,8 @@ def portfolio_summary(x_api_key: Optional[str] = Header(None)):
     with get_db_ctx() as con:
         trades = con.execute(
             """SELECT ticker, entry_price, date, verdict, source,
-                      position_size, order_id, fill_price, broker_status
+                      position_size, order_id, fill_price, broker_status,
+                      COALESCE(status, 'active')
                FROM paper_portfolio 
                WHERE source NOT IN ('deploy-test', 'test_suite', 'vps_test', 'test', 'e2e_test', 'smoke_test')
                  AND ticker NOT LIKE 'TEST%' AND ticker != 'PYTH' AND ticker != 'GHACT'
@@ -1172,6 +1290,7 @@ def portfolio_summary(x_api_key: Optional[str] = Header(None)):
             "verdict": v, "source": src,
             "position_size": r[5], "order_id": r[6],
             "fill_price": r[7], "broker_status": r[8] or "none",
+            "status": r[9] or "active",
         }
         recent_trades.append(trade_obj)
 
@@ -1516,9 +1635,13 @@ function renderCards(sum, seen, ev, attr, metrics) {
       <div class="sub">${ov.winners || 0} winners of ${ov.priced_count || 0} priced</div></div>
     <div class="card"><div class="label">Mean / Median P/L</div>
       <div class="val ${returnClass}">${returnSign}${avgReturn.toFixed(1)}%</div>
-      <div class="sub">Median: ${medSign}${medReturn.toFixed(1)}%</div></div>
-    <div class="card"><div class="label">Analyses / Seen</div><div class="val">${metrics.analyses_rows || 0}</div>
-      <div class="sub">${seenCount} active in seen ledger</div></div>
+      <div class="sub">Median: ${medSign}${medReturn.toFixed(1)}%${(() => {
+        const b = (attr && attr.benchmarks) ? attr.benchmarks : {};
+        const iwm = b.IWM && b.IWM.change_52w_pct != null ? 'IWM 52w: ' + (b.IWM.change_52w_pct >= 0 ? '+' : '') + b.IWM.change_52w_pct.toFixed(1) + '%' : '';
+        return iwm ? ' · ' + iwm : '';
+      })()}</div></div>
+    <div class="card"><div class="label">Analyses / Closed</div><div class="val">${metrics.analyses_rows || 0}</div>
+      <div class="sub">${seenCount} seen · ${metrics.closed_positions_rows || 0} closed</div></div>
     <div class="card"><div class="label">Sources</div><div class="val">${Object.keys(sum.by_source||{}).length}</div>
       <div class="sub">${sourcesStr}</div></div>`;
 }

@@ -35,9 +35,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DuckDB is single-writer. Serialize writes so two concurrent requests
-# cannot raise a write-write conflict (reads still run concurrently).
-_db_write_lock = threading.Lock()
+# DuckDB's in-process file handle registry can raise ResourceInUseException
+# ("Unique file handle conflict") when multiple threads concurrently
+# open/close the same database file. Serialize all DB connections on a
+# re-entrant lock so concurrent reads/writes cannot collide.
+_db_lock = threading.RLock()
+_db_write_lock = _db_lock
 
 DB_PATH = os.getenv("DUCKDB_PATH", "/home/ubuntu/primogreedy/data.duckdb")
 API_KEY = os.getenv("VPS_API_KEY", "")
@@ -51,6 +54,9 @@ MEMORY_TTL_SHORT = 14 * 24 * 60 * 60  # 14 days — AVOID / WATCH / unknown
 # relative to request volume; 10 minutes keeps /portfolio/evaluate off the
 # yfinance API for repeat hits while staying fresh enough for P&L display.
 PRICE_TTL = int(os.getenv("PRICE_TTL", str(10 * 60)))
+# Longer negative TTL for failed/delisted symbols (price == 0) to avoid
+# repeatedly hitting yfinance 404s every 10 minutes.
+NEGATIVE_PRICE_TTL = int(os.getenv("NEGATIVE_PRICE_TTL", str(6 * 60 * 60)))
 # Max concurrent yfinance fetches: bounded so a large portfolio cannot
 # stampede yfinance (which rate-limits aggressively) during one request.
 PRICE_FETCH_WORKERS = int(os.getenv("PRICE_FETCH_WORKERS", "8"))
@@ -83,11 +89,12 @@ def get_db() -> duckdb.DuckDBPyConnection:
 @contextmanager
 def get_db_ctx():
     """Context manager for DuckDB connections to ensure proper closure."""
-    con = get_db()
-    try:
-        yield con
-    finally:
-        con.close()
+    with _db_lock:
+        con = get_db()
+        try:
+            yield con
+        finally:
+            con.close()
 
 
 def init_db():
@@ -199,7 +206,8 @@ def _cache_get(ticker: str) -> Optional[dict]:
     if hit is None:
         return None
     ts, payload = hit
-    if time.time() - ts > PRICE_TTL:
+    ttl = NEGATIVE_PRICE_TTL if not payload.get("price") else PRICE_TTL
+    if time.time() - ts > ttl:
         return None
     return payload
 

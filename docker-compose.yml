@@ -10,3 +10,9 @@ services:
       - DUCKDB_PATH=/app/data.duckdb
       - VPS_API_KEY=${VPS_API_KEY}
     restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
